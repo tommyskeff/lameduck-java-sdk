@@ -21,3 +21,22 @@ jobs:
           java-version: 21
       - uses: gradle/actions/setup-gradle@v5
       - run: ./gradlew build
+
+  protos:
+    runs-on: ubuntu-latest
+    env:
+      CONTROLLER_REF: 9c2523e4edca1de058397a82feaa83f39335c9b5
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          repository: tommyskeff/lameduck-controller
+          ref: ${{ env.CONTROLLER_REF }}
+          token: ${{ secrets.CONTROLLER_REPO_TOKEN }}
+          path: controller
+          sparse-checkout: proto
+          persist-credentials: false
+      - name: Compare protos with the controller
+        run: diff -ru --exclude=fleet.proto controller/proto src/main/proto
