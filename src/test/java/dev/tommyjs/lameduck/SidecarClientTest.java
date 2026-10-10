@@ -1,5 +1,7 @@
 package dev.tommyjs.lameduck;
 
+import com.google.protobuf.Timestamp;
+import dev.tommyjs.lameduck.v1.DrainReason;
 import dev.tommyjs.lameduck.v1.MarkDrainedRequest;
 import dev.tommyjs.lameduck.v1.MarkDrainedResponse;
 import dev.tommyjs.lameduck.v1.Phase;
@@ -22,6 +24,9 @@ import org.junit.jupiter.api.Test;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -104,11 +109,90 @@ public class SidecarClientTest {
         assertEquals(2, service.watches.get(), "watch should have reconnected once");
     }
 
+    @Test
+    public void skipsUnspecifiedState() throws Exception {
+        service.scripts = List.of(List.of(PodState.getDefaultInstance(), active()));
+        BlockingQueue<PodState> states = new LinkedBlockingQueue<>();
+
+        try (StateSubscription subscription = client.watch(states::add)) {
+            assertEquals(Phase.PHASE_ACTIVE, states.poll(5, TimeUnit.SECONDS).getPhase());
+        }
+
+        assertEquals(List.of(), List.copyOf(states));
+    }
+
+    @Test
+    public void keepsDrainAcrossRestartedSidecarReportingUnspecified() throws Exception {
+        service.scripts = List.of(
+            List.of(draining(100)),
+            List.of(PodState.getDefaultInstance(), draining(100), active())
+        );
+
+        assertEquals(List.of("drain 100", "cancelled"), watchDrainEvents(2));
+    }
+
+    @Test
+    public void keepsDrainAcrossRestartedSidecarReportingStarting() throws Exception {
+        service.scripts = List.of(
+            List.of(draining(100)),
+            List.of(starting(), draining(100), active())
+        );
+
+        assertEquals(List.of("drain 100", "cancelled"), watchDrainEvents(2));
+    }
+
+    private List<String> watchDrainEvents(int count) throws InterruptedException {
+        BlockingQueue<String> events = new LinkedBlockingQueue<>();
+        DrainListener listener = new DrainListener() {
+
+            @Override
+            public void onDrain(DrainReason reason, Instant deadline) {
+                events.add("drain " + deadline.getEpochSecond());
+            }
+
+            @Override
+            public void onDrainCancelled() {
+                events.add("cancelled");
+            }
+
+        };
+        List<String> received = new ArrayList<>();
+        try (StateSubscription subscription = client.watchDrain(listener)) {
+            for (int i = 0; i < count; i++) {
+                String event = events.poll(5, TimeUnit.SECONDS);
+                if (event == null) {
+                    break;
+                }
+                received.add(event);
+            }
+        }
+        received.addAll(events);
+        return received;
+    }
+
+    private static PodState starting() {
+        return PodState.newBuilder().setPhase(Phase.PHASE_STARTING).build();
+    }
+
+    private static PodState active() {
+        return PodState.newBuilder().setPhase(Phase.PHASE_ACTIVE).build();
+    }
+
+    private static PodState draining(long deadline) {
+        return PodState.newBuilder()
+            .setPhase(Phase.PHASE_DRAINING)
+            .setDrainReason(DrainReason.DRAIN_REASON_ROLLOUT)
+            .setDrainDeadline(Timestamp.newBuilder().setSeconds(deadline))
+            .build();
+    }
+
     private static final class FakeSidecarService extends SidecarServiceGrpc.SidecarServiceImplBase {
 
         private final AtomicLong load = new AtomicLong(-1);
 
         private final AtomicInteger watches = new AtomicInteger();
+
+        private volatile List<List<PodState>> scripts = List.of(List.of(starting()), List.of(starting()));
 
         @Override
         public void setLoad(SetLoadRequest request, StreamObserver<SetLoadResponse> responseObserver) {
@@ -124,10 +208,12 @@ public class SidecarClientTest {
 
         @Override
         public void watchState(WatchStateRequest request, StreamObserver<WatchStateResponse> responseObserver) {
-            int count = watches.incrementAndGet();
-            PodState state = PodState.newBuilder().setPhase(Phase.PHASE_STARTING).build();
-            responseObserver.onNext(WatchStateResponse.newBuilder().setState(state).build());
-            if (count == 1) {
+            int index = watches.incrementAndGet() - 1;
+            List<List<PodState>> current = scripts;
+            for (PodState state : current.get(Math.min(index, current.size() - 1))) {
+                responseObserver.onNext(WatchStateResponse.newBuilder().setState(state).build());
+            }
+            if (index < current.size() - 1) {
                 responseObserver.onCompleted();
             }
         }

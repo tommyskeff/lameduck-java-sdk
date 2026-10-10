@@ -1,5 +1,7 @@
 package dev.tommyjs.lameduck;
 
+import dev.tommyjs.lameduck.v1.Phase;
+import dev.tommyjs.lameduck.v1.PodState;
 import dev.tommyjs.lameduck.v1.SidecarServiceGrpc;
 import dev.tommyjs.lameduck.v1.WatchStateRequest;
 import dev.tommyjs.lameduck.v1.WatchStateResponse;
@@ -82,7 +84,11 @@ public final class StateSubscription implements AutoCloseable {
         @Override
         public void onNext(WatchStateResponse response) {
             backoff = MIN_BACKOFF;
-            listener.onState(response.getState());
+            PodState state = response.getState();
+            if (state.getPhase() == Phase.PHASE_UNSPECIFIED) {
+                return;
+            }
+            listener.onState(state);
         }
 
         @Override
